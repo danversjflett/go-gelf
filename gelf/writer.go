@@ -26,7 +26,7 @@ import (
 // messages to a graylog2 server, or data from a stream-oriented
 // interface (like the functions in log).
 type Writer struct {
-	mu               sync.Mutex
+	Mu               sync.Mutex
 	conn             net.Conn
 	hostname         string
 	Facility         string // defaults to current process name
