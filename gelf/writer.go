@@ -16,10 +16,7 @@ import (
 	"net"
 	"os"
 	"path"
-	"runtime"
-	"strings"
 	"sync"
-	"time"
 )
 
 // Writer implements io.Writer and is used to send both discrete
@@ -72,18 +69,6 @@ var (
 	magicChunked = []byte{0x1e, 0x0f}
 	magicZlib    = []byte{0x78}
 	magicGzip    = []byte{0x1f, 0x8b}
-)
-
-// Syslog severity levels
-const (
-	LOG_EMERG   = int32(0)
-	LOG_ALERT   = int32(1)
-	LOG_CRIT    = int32(2)
-	LOG_ERR     = int32(3)
-	LOG_WARNING = int32(4)
-	LOG_NOTICE  = int32(5)
-	LOG_INFO    = int32(6)
-	LOG_DEBUG   = int32(7)
 )
 
 // numChunks returns the number of GELF chunks necessary to transmit
@@ -192,17 +177,11 @@ func newBuffer() *bytes.Buffer {
 	return bytes.NewBuffer(nil)
 }
 
-// WriteMessage sends the specified message to the GELF server
+// Write sends the specified message to the GELF server
 // specified in the call to New().  It assumes all the fields are
-// filled out appropriately.  In general, clients will want to use
-// Write, rather than WriteMessage.
-func (w *Writer) WriteMessage(m *Message) (err error) {
-	mBuf := newBuffer()
-	defer bufPool.Put(mBuf)
-	if err = m.MarshalJSONBuf(mBuf); err != nil {
-		return err
-	}
-	mBytes := mBuf.Bytes()
+// filled out appropriately.
+func (w *Writer) Write(p []byte) (n int, err error) {
+	p = bytes.TrimSpace(p)
 
 	var (
 		zBuf   *bytes.Buffer
@@ -220,7 +199,7 @@ func (w *Writer) WriteMessage(m *Message) (err error) {
 		defer bufPool.Put(zBuf)
 		zw, err = zlib.NewWriterLevel(zBuf, w.CompressionLevel)
 	case CompressNone:
-		zBytes = mBytes
+		zBytes = p
 	default:
 		panic(fmt.Sprintf("unknown compression type %d",
 			w.CompressionType))
@@ -229,7 +208,7 @@ func (w *Writer) WriteMessage(m *Message) (err error) {
 		if err != nil {
 			return
 		}
-		if _, err = zw.Write(mBytes); err != nil {
+		if _, err = zw.Write(p); err != nil {
 			zw.Close()
 			return
 		}
@@ -238,181 +217,20 @@ func (w *Writer) WriteMessage(m *Message) (err error) {
 	}
 
 	if numChunks(zBytes) > 1 {
-		return w.writeChunked(zBytes)
+		return len(p), w.writeChunked(zBytes)
 	}
-	n, err := w.conn.Write(zBytes)
+	zn, err := w.conn.Write(zBytes)
 	if err != nil {
 		return
 	}
-	if n != len(zBytes) {
-		return fmt.Errorf("bad write (%d/%d)", n, len(zBytes))
-	}
-
-	return nil
-}
-
-// Close connection and interrupt blocked Read or Write operations
-func (w *Writer) Close() error {
-	return w.conn.Close()
-}
-
-/*
-func (w *Writer) Alert(m string) (err error)
-func (w *Writer) Close() error
-func (w *Writer) Crit(m string) (err error)
-func (w *Writer) Debug(m string) (err error)
-func (w *Writer) Emerg(m string) (err error)
-func (w *Writer) Err(m string) (err error)
-func (w *Writer) Info(m string) (err error)
-func (w *Writer) Notice(m string) (err error)
-func (w *Writer) Warning(m string) (err error)
-*/
-
-// getCaller returns the filename and the line info of a function
-// further down in the call stack.  Passing 0 in as callDepth would
-// return info on the function calling getCallerIgnoringLog, 1 the
-// parent function, and so on.  Any suffixes passed to getCaller are
-// path fragments like "/pkg/log/log.go", and functions in the call
-// stack from that file are ignored.
-func getCaller(callDepth int, suffixesToIgnore ...string) (file string, line int) {
-	// bump by 1 to ignore the getCaller (this) stackframe
-	callDepth++
-outer:
-	for {
-		var ok bool
-		_, file, line, ok = runtime.Caller(callDepth)
-		if !ok {
-			file = "???"
-			line = 0
-			break
-		}
-
-		for _, s := range suffixesToIgnore {
-			if strings.HasSuffix(file, s) {
-				callDepth++
-				continue outer
-			}
-		}
-		break
-	}
-	return
-}
-
-func getCallerIgnoringLogMulti(callDepth int) (string, int) {
-	// the +1 is to ignore this (getCallerIgnoringLogMulti) frame
-	return getCaller(callDepth+1, "/pkg/log/log.go", "/pkg/io/multi.go")
-}
-
-// Write encodes the given string in a GELF message and sends it to
-// the server specified in New().
-func (w *Writer) Write(p []byte) (n int, err error) {
-
-	// 1 for the function that called us.
-	file, line := getCallerIgnoringLogMulti(1)
-
-	// remove trailing and leading whitespace
-	p = bytes.TrimSpace(p)
-
-	// If there are newlines in the message, use the first line
-	// for the short message and set the full message to the
-	// original input.  If the input has no newlines, stick the
-	// whole thing in Short.
-	short := p
-	full := []byte("")
-	if i := bytes.IndexRune(p, '\n'); i > 0 {
-		short = p[:i]
-		full = p
-	}
-
-	m := Message{
-		Version:  "1.1",
-		Host:     w.hostname,
-		Short:    string(short),
-		Full:     string(full),
-		TimeUnix: float64(time.Now().Unix()),
-		Level:    6, // info
-		Facility: w.Facility,
-		Extra: map[string]interface{}{
-			"_file": file,
-			"_line": line,
-		},
-	}
-
-	if err = w.WriteMessage(&m); err != nil {
-		return 0, err
+	if zn != len(zBytes) {
+		return 0, fmt.Errorf("bad write (%d/%d)", zn, len(zBytes))
 	}
 
 	return len(p), nil
 }
 
-func (m *Message) MarshalJSONBuf(buf *bytes.Buffer) error {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	// write up until the final }
-	if _, err = buf.Write(b[:len(b)-1]); err != nil {
-		return err
-	}
-	if len(m.Extra) > 0 {
-		eb, err := json.Marshal(m.Extra)
-		if err != nil {
-			return err
-		}
-		// merge serialized message + serialized extra map
-		if err = buf.WriteByte(','); err != nil {
-			return err
-		}
-		// write serialized extra bytes, without enclosing quotes
-		if _, err = buf.Write(eb[1 : len(eb)-1]); err != nil {
-			return err
-		}
-	}
-
-	if len(m.RawExtra) > 0 {
-		if err := buf.WriteByte(','); err != nil {
-			return err
-		}
-
-		// write serialized extra bytes, without enclosing quotes
-		if _, err = buf.Write(m.RawExtra[1 : len(m.RawExtra)-1]); err != nil {
-			return err
-		}
-	}
-
-	// write final closing quotes
-	return buf.WriteByte('}')
-}
-
-func (m *Message) UnmarshalJSON(data []byte) error {
-	i := make(map[string]interface{}, 16)
-	if err := json.Unmarshal(data, &i); err != nil {
-		return err
-	}
-	for k, v := range i {
-		if k[0] == '_' {
-			if m.Extra == nil {
-				m.Extra = make(map[string]interface{}, 1)
-			}
-			m.Extra[k] = v
-			continue
-		}
-		switch k {
-		case "version":
-			m.Version = v.(string)
-		case "host":
-			m.Host = v.(string)
-		case "short_message":
-			m.Short = v.(string)
-		case "full_message":
-			m.Full = v.(string)
-		case "timestamp":
-			m.TimeUnix = v.(float64)
-		case "level":
-			m.Level = int32(v.(float64))
-		case "facility":
-			m.Facility = v.(string)
-		}
-	}
-	return nil
+// Close connection and interrupt blocked Read or Write operations
+func (w *Writer) Close() error {
+	return w.conn.Close()
 }
